@@ -19,7 +19,7 @@ Skrypt wykonuje następujące operacje:
 
 1. Sklonuj to repozytorium:
 ```
-git clone https://github.com/twój-użytkownik/osm-relation-ways.git
+git clone https://github.com/danskonieczny/osm-relation-ways.git
 cd osm-relation-ways
 ```
 
@@ -60,7 +60,7 @@ Ten projekt jest udostępniany na licencji MIT. Szczegóły znajdziesz w pliku L
 
 ## Autor
 
-[Daniel/skoniecznydaniel]
+[Daniel/danskonieczny]
 
 ## Podziękowania
 
