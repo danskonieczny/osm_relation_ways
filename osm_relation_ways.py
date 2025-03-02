@@ -1,0 +1,269 @@
+import os
+import sys
+import requests
+import xml.etree.ElementTree as ET
+import json
+import geojson
+from shapely.geometry import LineString, mapping
+
+def fetch_relation(relation_id):
+    """Pobiera dane relacji OSM na podstawie ID."""
+    url = f"https://api.openstreetmap.org/api/0.6/relation/{relation_id}/full"
+    response = requests.get(url)
+    if response.status_code != 200:
+        print(f"Błąd pobierania danych: {response.status_code}")
+        sys.exit(1)
+    return response.text
+
+def extract_relation_name(xml_data):
+    """Wyciąga nazwę relacji z danych XML."""
+    root = ET.fromstring(xml_data)
+    for relation in root.findall(".//relation"):
+        for tag in relation.findall("tag"):
+            if tag.get("k") == "name":
+                return tag.get("v")
+    return f"relation_{relation_id}"  # Domyślna nazwa jeśli nie znaleziono
+
+def extract_ways(xml_data):
+    """Wyciąga dane dróg z relacji."""
+    root = ET.fromstring(xml_data)
+    
+    # Zbieranie wszystkich węzłów
+    nodes = {}
+    for node in root.findall(".//node"):
+        node_id = node.get("id")
+        lat = float(node.get("lat"))
+        lon = float(node.get("lon"))
+        nodes[node_id] = (lon, lat)  # GeoJSON używa (długość, szerokość)
+    
+    # Słownik do przechowywania informacji o rolach elementów w relacji
+    member_roles = {}
+    
+    # Pobierz informacje o rolach elementów w relacji
+    for relation in root.findall(".//relation"):
+        for member in relation.findall("member"):
+            if member.get("type") == "way":
+                way_id = member.get("ref")
+                role = member.get("role", "")
+                member_roles[way_id] = role
+    
+    # Zbieranie dróg z zachowaniem oryginalnej kolejności
+    # Uwzględniamy TYLKO elementy z pustą rolą (role="")
+    raw_ways = []
+    for way in root.findall(".//way"):
+        way_id = way.get("id")
+        
+        # Sprawdź, czy ta droga ma pustą rolę w relacji
+        if way_id in member_roles and member_roles[way_id] == "":
+            way_nodes = []
+            way_node_ids = []
+            
+            for nd in way.findall("nd"):
+                ref = nd.get("ref")
+                if ref in nodes:
+                    way_nodes.append(nodes[ref])
+                    way_node_ids.append(ref)
+            
+            if len(way_nodes) >= 2:  # Droga musi mieć co najmniej 2 punkty
+                raw_ways.append({
+                    "id": way_id,
+                    "nodes": way_nodes,
+                    "node_ids": way_node_ids,
+                    "start_node": way_node_ids[0],
+                    "end_node": way_node_ids[-1]
+                })
+    
+    return raw_ways
+
+def arrange_ways_in_order(raw_ways):
+    """Układa odcinki dróg w kolejności, aby tworzyły spójną trasę."""
+    if not raw_ways:
+        return []
+    
+    # Filtrujemy tylko odcinki, które nie są pętlami
+    route_ways = []
+    loop_ways = []
+    
+    for way in raw_ways:
+        if way["start_node"] == way["end_node"]:
+            loop_ways.append(way)
+        else:
+            route_ways.append(way)
+    
+    if not route_ways:
+        return raw_ways  # Jeśli nie ma głównych odcinków trasy, zwróć wszystkie
+    
+    # Tworzenie słownika węzłów końcowych do odcinków
+    end_to_ways = {}
+    start_to_ways = {}
+    
+    for i, way in enumerate(route_ways):
+        start_node = way["start_node"]
+        end_node = way["end_node"]
+        
+        if start_node not in start_to_ways:
+            start_to_ways[start_node] = []
+        start_to_ways[start_node].append(i)
+        
+        if end_node not in end_to_ways:
+            end_to_ways[end_node] = []
+        end_to_ways[end_node].append(i)
+    
+    # Znajdowanie potencjalnego początku trasy
+    # Początek to węzeł, który jest punktem początkowym jakiegoś odcinka, 
+    # ale nie jest punktem końcowym żadnego innego odcinka lub występuje rzadziej jako końcowy
+    potential_starts = []
+    for node in start_to_ways:
+        if node not in end_to_ways:
+            potential_starts.append((node, 999))  # Wysoki priorytet dla węzłów, które są tylko startowe
+        else:
+            # Jeśli węzeł występuje częściej jako początkowy niż końcowy
+            if len(start_to_ways[node]) > len(end_to_ways[node]):
+                potential_starts.append((node, len(start_to_ways[node]) - len(end_to_ways[node])))
+    
+    # Sortuj potencjalne początki wg priorytetu (malejąco)
+    potential_starts.sort(key=lambda x: x[1], reverse=True)
+    
+    ordered_ways = []
+    used_indices = set()
+    
+    # Próbujemy zbudować spójną trasę
+    if potential_starts:
+        current_node = potential_starts[0][0]  # Bierzemy węzeł o najwyższym priorytecie
+        
+        # Budujemy główną trasę od początku do końca
+        while True:
+            # Szukamy odcinka, który zaczyna się od current_node i nie był jeszcze użyty
+            next_way_index = None
+            for i in start_to_ways.get(current_node, []):
+                if i not in used_indices:
+                    next_way_index = i
+                    break
+            
+            if next_way_index is None:
+                break  # Nie znaleźliśmy pasującego odcinka, kończymy główną trasę
+            
+            ordered_ways.append(route_ways[next_way_index])
+            used_indices.add(next_way_index)
+            current_node = route_ways[next_way_index]["end_node"]
+    
+    # Dodajemy pozostałe odcinki główne, które nie zostały jeszcze dodane
+    for i, way in enumerate(route_ways):
+        if i not in used_indices:
+            ordered_ways.append(way)
+    
+    # Dodajemy pętle na końcu
+    ordered_ways.extend(loop_ways)
+    
+    return ordered_ways
+
+def create_geojson(ways):
+    """Tworzy plik GeoJSON na podstawie dróg."""
+    # Najpierw układamy drogi w odpowiedniej kolejności
+    ordered_ways = arrange_ways_in_order(ways)
+    
+    features = []
+    
+    # Dodajemy informację o oryginalnej kolejności
+    for i, way in enumerate(ordered_ways):
+        line = LineString(way["nodes"])
+        
+        # Podstawowe właściwości
+        properties = {
+            "id": way["id"],
+            "order": i,
+            "start_node": way["start_node"],
+            "end_node": way["end_node"]
+        }
+        
+        feature = geojson.Feature(
+            geometry=mapping(line),
+            properties=properties
+        )
+        features.append(feature)
+    
+    return geojson.FeatureCollection(features), ordered_ways
+
+def save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, output_dir):
+    """Zapisuje wszystkie pliki wyjściowe."""
+    # Tworzenie katalogu głównego jeśli nie istnieje
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Zapisanie pliku XML
+    with open(os.path.join(output_dir, f"relation_{relation_id}.xml"), "w", encoding="utf-8") as f:
+        f.write(xml_data)
+    
+    # Zapisanie pliku JSON z oryginalnymi drogami
+    with open(os.path.join(output_dir, f"relation_{relation_id}_ways_raw.json"), "w", encoding="utf-8") as f:
+        json.dump(raw_ways, f, ensure_ascii=False, indent=2)
+    
+    # Zapisanie pliku JSON z uporządkowanymi drogami
+    with open(os.path.join(output_dir, f"relation_{relation_id}_ways_ordered.json"), "w", encoding="utf-8") as f:
+        json.dump(ordered_ways, f, ensure_ascii=False, indent=2)
+    
+    # Zapisanie pliku GeoJSON
+    with open(os.path.join(output_dir, f"relation_{relation_id}.geojson"), "w", encoding="utf-8") as f:
+        geojson.dump(geojson_data, f, ensure_ascii=False, indent=2)
+        
+    # Zapisanie prostego pliku z podsumowaniem
+    with open(os.path.join(output_dir, f"relation_{relation_id}_summary.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Relacja: {relation_id}\n")
+        f.write(f"Liczba odcinków trasy: {len(ordered_ways)}\n\n")
+        
+        f.write("Odcinki trasy (kolejność):\n")
+        for i, way in enumerate(ordered_ways):
+            f.write(f"{i+1}. Way ID: {way['id']} (od węzła {way['start_node']} do {way['end_node']})\n")
+
+def main():
+    if len(sys.argv) != 2:
+        print("Użycie: python osm_relation_ways.py <relation_id>")
+        sys.exit(1)
+    
+    relation_id = sys.argv[1]
+    print(f"Pobieranie relacji {relation_id}...")
+    
+    # Pobieranie danych relacji
+    xml_data = fetch_relation(relation_id)
+    
+    # Wyciąganie nazwy relacji
+    relation_name = extract_relation_name(xml_data)
+    print(f"Nazwa relacji: {relation_name}")
+    
+    # Tworzenie struktury katalogów
+    base_dir = "osm_relations"
+    output_dir = os.path.join(base_dir, relation_name)
+    
+    # Tworzenie katalogu bazowego, jeśli nie istnieje
+    if not os.path.exists(base_dir):
+        os.makedirs(base_dir)
+    
+    # Tworzenie katalogu dla konkretnej relacji, jeśli nie istnieje
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Przetwarzanie danych
+    raw_ways = extract_ways(xml_data)  # Zawiera tylko elementy z pustą rolą
+    geojson_data, ordered_ways = create_geojson(raw_ways)
+    
+    # Zapisywanie plików
+    save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, output_dir)
+    
+    print(f"Dane zostały zapisane w katalogu: {output_dir}")
+    print(f"Liczba znalezionych odcinków trasy z rolą=\"\": {len(raw_ways)}")
+    
+    # Informacja o uporządkowanej trasie
+    print("\nOdcinki trasy zostały ułożone w następującej kolejności:")
+    for i, way in enumerate(ordered_ways):
+        print(f"{i+1}. Way ID: {way['id']} (od węzła {way['start_node']} do {way['end_node']})")
+            
+    print(f"\nWszystkie pliki zostały zapisane w folderze: {output_dir}")
+    print(f"- relation_{relation_id}.xml - pełne dane XML")
+    print(f"- relation_{relation_id}_ways_raw.json - oryginalne dane odcinków")
+    print(f"- relation_{relation_id}_ways_ordered.json - uporządkowane odcinki")
+    print(f"- relation_{relation_id}.geojson - dane geograficzne")
+    print(f"- relation_{relation_id}_summary.txt - podsumowanie")
+    print("\nGotowe!")
+
+if __name__ == "__main__":
+    main()
