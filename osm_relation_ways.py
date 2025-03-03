@@ -1,10 +1,104 @@
+def haversine_distance(coord1, coord2):
+    """Oblicza odległość między dwoma punktami na powierzchni Ziemi w metrach."""
+    lon1, lat1 = coord1
+    lon2, lat2 = coord2
+    
+    # Zamiana stopni na radiany
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    
+    # Wzór haversine'a
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    r = 6371000  # Promień Ziemi w metrach
+    
+    return c * r
+
+def calculate_segment_length(segment):
+    """Oblicza długość segmentu drogi w metrach."""
+    total_length = 0
+    for i in range(len(segment) - 1):
+        total_length += haversine_distance(segment[i], segment[i+1])
+    return total_length
+
+def calculate_route_length(ways):
+    """Oblicza całkowitą długość trasy w metrach."""
+    total_length = 0
+    for way in ways:
+        total_length += calculate_segment_length(way["nodes"])
+    return total_length
+
+def locate_stops_on_route(ordered_ways, stop_nodes):
+    """Lokalizuje przystanki na trasie i oblicza odległość od początku trasy."""
+    if not stop_nodes:
+        return []
+        
+    # Budujemy całą trasę jako listę punktów
+    complete_route = []
+    distance_to_node = {}  # Dystans od początku trasy do każdego węzła
+    current_dist = 0
+    
+    for way in ordered_ways:
+        for i, node in enumerate(way["nodes"]):
+            if i > 0:  # Nie dodawaj dystansu dla pierwszego punktu w segmencie
+                segment_length = haversine_distance(way["nodes"][i-1], node)
+                current_dist += segment_length
+            
+            point_key = f"{node[0]},{node[1]}"
+            if point_key not in distance_to_node:  # Jeśli punkt już istnieje, zachowaj pierwszy dystans
+                distance_to_node[point_key] = current_dist
+            
+            complete_route.append(node)
+    
+    # Dla każdego przystanku znajdź najbliższy punkt na trasie
+    for stop in stop_nodes:
+        stop_point = Point(stop["position"])
+        min_distance = float('inf')
+        closest_idx = -1
+        
+        # Znajdź najbliższy punkt na trasie
+        for i, route_point in enumerate(complete_route):
+            route_point_geom = Point(route_point)
+            distance = stop_point.distance(route_point_geom)
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_idx = i
+        
+        if closest_idx != -1:
+            closest_point = complete_route[closest_idx]
+            point_key = f"{closest_point[0]},{closest_point[1]}"
+            # Ustaw odległość przystanku od początku trasy
+            stop["dist_from_start"] = distance_to_node.get(point_key, 0)
+    
+    # Sortuj przystanki według odległości od początku trasy
+    sorted_stops = sorted(stop_nodes, key=lambda x: x["dist_from_start"])
+    
+    # Oblicz odległości między przystankami
+    for i in range(len(sorted_stops)):
+        # Odległość od poprzedniego przystanku
+        if i > 0:
+            sorted_stops[i]["distance_from_prev"] = sorted_stops[i]["dist_from_start"] - sorted_stops[i-1]["dist_from_start"]
+        else:
+            sorted_stops[i]["distance_from_prev"] = 0
+        
+        # Odległość do następnego przystanku
+        if i < len(sorted_stops) - 1:
+            sorted_stops[i]["distance_to_next"] = sorted_stops[i+1]["dist_from_start"] - sorted_stops[i]["dist_from_start"]
+        else:
+            sorted_stops[i]["distance_to_next"] = 0  # Dla ostatniego przystanku
+    
+    return sorted_stops
+
 import os
 import sys
 import requests
 import xml.etree.ElementTree as ET
 import json
 import geojson
-from shapely.geometry import LineString, mapping
+from shapely.geometry import LineString, Point, mapping
+import math
 
 def sanitize_directory_name(name, relation_id=None):
     """Czyści nazwę katalogu, aby była bezpieczna na różnych systemach operacyjnych."""
@@ -42,8 +136,8 @@ def extract_relation_name(xml_data, relation_id):
                 return sanitize_directory_name(tag.get("v"), relation_id)
     return f"relation_{relation_id}"  # Domyślna nazwa jeśli nie znaleziono
 
-def extract_ways(xml_data):
-    """Wyciąga dane dróg z relacji."""
+def extract_ways_and_stops(xml_data):
+    """Wyciąga dane dróg i przystanków z relacji."""
     root = ET.fromstring(xml_data)
     
     # Zbieranie wszystkich węzłów
@@ -56,6 +150,7 @@ def extract_ways(xml_data):
     
     # Słownik do przechowywania informacji o rolach elementów w relacji
     member_roles = {}
+    stop_nodes = []
     
     # Pobierz informacje o rolach elementów w relacji
     for relation in root.findall(".//relation"):
@@ -64,6 +159,16 @@ def extract_ways(xml_data):
                 way_id = member.get("ref")
                 role = member.get("role", "")
                 member_roles[way_id] = role
+            elif member.get("type") == "node" and member.get("role") in ["stop", "stop_entry_only", "stop_exit_only", "platform", "platform_entry_only", "platform_exit_only"]:
+                stop_node_ref = member.get("ref")
+                if stop_node_ref in nodes:
+                    # Zapisz pozycję, ID i rolę przystanku
+                    stop_nodes.append({
+                        "id": stop_node_ref,
+                        "position": nodes[stop_node_ref],
+                        "role": member.get("role", ""),
+                        "dist_from_start": 0  # To będzie obliczone później
+                    })
     
     # Zbieranie dróg z zachowaniem oryginalnej kolejności
     # Uwzględniamy TYLKO elementy z pustą rolą (role="")
@@ -91,7 +196,7 @@ def extract_ways(xml_data):
                     "end_node": way_node_ids[-1]
                 })
     
-    return raw_ways
+    return raw_ways, stop_nodes
 
 def arrange_ways_in_order(raw_ways):
     """Układa odcinki dróg w kolejności, aby tworzyły spójną trasę."""
@@ -175,20 +280,21 @@ def arrange_ways_in_order(raw_ways):
     
     return ordered_ways
 
-def create_geojson(ways):
-    """Tworzy plik GeoJSON na podstawie dróg."""
+def create_geojson(ways, stops=None):
+    """Tworzy plik GeoJSON na podstawie dróg i przystanków."""
     # Najpierw układamy drogi w odpowiedniej kolejności
     ordered_ways = arrange_ways_in_order(ways)
     
     features = []
     
-    # Dodajemy informację o oryginalnej kolejności
+    # Dodajemy informację o oryginalnej kolejności dróg
     for i, way in enumerate(ordered_ways):
         line = LineString(way["nodes"])
         
         # Podstawowe właściwości
         properties = {
             "id": way["id"],
+            "type": "route_segment",
             "order": i,
             "start_node": way["start_node"],
             "end_node": way["end_node"]
@@ -200,9 +306,30 @@ def create_geojson(ways):
         )
         features.append(feature)
     
+    # Dodajemy przystanki jako punkty (jeśli są)
+    if stops:
+        for i, stop in enumerate(stops):
+            point = Point(stop["position"])
+            
+            properties = {
+                "id": stop["id"],
+                "type": "stop",
+                "order": i,
+                "role": stop.get("role", "stop"),
+                "dist_from_start": stop["dist_from_start"],
+                "distance_from_prev": stop["distance_from_prev"],
+                "distance_to_next": stop["distance_to_next"]
+            }
+            
+            feature = geojson.Feature(
+                geometry=mapping(point),
+                properties=properties
+            )
+            features.append(feature)
+    
     return geojson.FeatureCollection(features), ordered_ways
 
-def save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, output_dir):
+def save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, stops_data, route_length, output_dir):
     """Zapisuje wszystkie pliki wyjściowe."""
     # Tworzenie katalogu głównego jeśli nie istnieje
     if not os.path.exists(output_dir):
@@ -223,15 +350,30 @@ def save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, outp
     # Zapisanie pliku GeoJSON
     with open(os.path.join(output_dir, f"relation_{relation_id}.geojson"), "w", encoding="utf-8") as f:
         geojson.dump(geojson_data, f, ensure_ascii=False, indent=2)
-        
+    
+    # Zapisanie pliku JSON z przystankami
+    if stops_data:
+        with open(os.path.join(output_dir, f"relation_{relation_id}_stops.json"), "w", encoding="utf-8") as f:
+            json.dump(stops_data, f, ensure_ascii=False, indent=2)
+    
     # Zapisanie prostego pliku z podsumowaniem
     with open(os.path.join(output_dir, f"relation_{relation_id}_summary.txt"), "w", encoding="utf-8") as f:
         f.write(f"Relacja: {relation_id}\n")
-        f.write(f"Liczba odcinków trasy: {len(ordered_ways)}\n\n")
+        f.write(f"Liczba odcinków trasy: {len(ordered_ways)}\n")
+        f.write(f"Całkowita długość trasy: {route_length:.2f} m ({route_length/1000:.2f} km)\n\n")
         
         f.write("Odcinki trasy (kolejność):\n")
         for i, way in enumerate(ordered_ways):
             f.write(f"{i+1}. Way ID: {way['id']} (od węzła {way['start_node']} do {way['end_node']})\n")
+        
+        if stops_data:
+            f.write("\nPrzystanki (od początku trasy):\n")
+            for i, stop in enumerate(stops_data):
+                role_text = stop.get("role", "stop")
+                f.write(f"{i+1}. Stop ID: {stop['id']} (role=\"{role_text}\")\n")
+                f.write(f"   Odległość od początku trasy: {stop['dist_from_start']:.2f} m ({stop['dist_from_start']/1000:.2f} km)\n")
+                f.write(f"   Odległość od poprzedniego przystanku: {stop['distance_from_prev']:.2f} m ({stop['distance_from_prev']/1000:.2f} km)\n")
+                f.write(f"   Odległość do następnego przystanku: {stop['distance_to_next']:.2f} m ({stop['distance_to_next']/1000:.2f} km)\n")
 
 def main():
     if len(sys.argv) != 2:
@@ -269,17 +411,34 @@ def main():
             os.makedirs(output_dir)
     
     # Przetwarzanie danych
-    raw_ways = extract_ways(xml_data)  # Zawiera tylko elementy z pustą rolą
+    raw_ways, stop_nodes = extract_ways_and_stops(xml_data)
     
     if not raw_ways:
         print(f"Nie znaleziono elementów z pustą rolą (role=\"\") w relacji {relation_id}.")
         print("Sprawdź, czy relacja zawiera elementy typu 'way' z pustą rolą.")
         sys.exit(1)
+    
+    # Tworzenie GeoJSON i porządkowanie odcinków
+    geojson_data, ordered_ways = create_geojson(raw_ways, None)  # Najpierw bez przystanków
+    
+    # Obliczanie długości trasy
+    route_length = calculate_route_length(ordered_ways)
+    print(f"Całkowita długość trasy: {route_length:.2f} m ({route_length/1000:.2f} km)")
+    
+    # Lokalizowanie przystanków na trasie
+    if stop_nodes:
+        stop_types = set([stop.get("role", "stop") for stop in stop_nodes])
+        print(f"Znaleziono {len(stop_nodes)} przystanków z rolami: {', '.join(stop_types)}")
+        ordered_stops = locate_stops_on_route(ordered_ways, stop_nodes)
         
-    geojson_data, ordered_ways = create_geojson(raw_ways)
+        # Aktualizacja GeoJSON z przystankami
+        geojson_data, _ = create_geojson(raw_ways, ordered_stops)
+    else:
+        print("Nie znaleziono przystanków (role=\"stop\", \"stop_entry_only\", \"stop_exit_only\", itp.) w relacji.")
+        ordered_stops = []
     
     # Zapisywanie plików
-    save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, output_dir)
+    save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, ordered_stops, route_length, output_dir)
     
     print(f"Dane zostały zapisane w katalogu: {output_dir}")
     print(f"Liczba znalezionych odcinków trasy z rolą=\"\": {len(raw_ways)}")
@@ -288,12 +447,23 @@ def main():
     print("\nOdcinki trasy zostały ułożone w następującej kolejności:")
     for i, way in enumerate(ordered_ways):
         print(f"{i+1}. Way ID: {way['id']} (od węzła {way['start_node']} do {way['end_node']})")
+    
+    # Informacja o przystankach
+    if ordered_stops:
+        print("\nPrzystanki (od początku trasy):")
+        for i, stop in enumerate(ordered_stops):
+            role = stop.get("role", "stop")
+            print(f"{i+1}. Stop ID: {stop['id']} (role=\"{role}\") - odległość od początku: {stop['dist_from_start']:.2f} m")
+            print(f"   Odległość od poprzedniego przystanku: {stop['distance_from_prev']:.2f} m")
+            print(f"   Odległość do następnego przystanku: {stop['distance_to_next']:.2f} m")
             
     print(f"\nWszystkie pliki zostały zapisane w folderze: {output_dir}")
     print(f"- relation_{relation_id}.xml - pełne dane XML")
     print(f"- relation_{relation_id}_ways_raw.json - oryginalne dane odcinków")
     print(f"- relation_{relation_id}_ways_ordered.json - uporządkowane odcinki")
-    print(f"- relation_{relation_id}.geojson - dane geograficzne")
+    print(f"- relation_{relation_id}.geojson - dane geograficzne z trasą i przystankami")
+    if ordered_stops:
+        print(f"- relation_{relation_id}_stops.json - dane przystanków z odległościami")
     print(f"- relation_{relation_id}_summary.txt - podsumowanie")
     print("\nGotowe!")
 
