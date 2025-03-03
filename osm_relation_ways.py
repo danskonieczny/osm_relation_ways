@@ -6,6 +6,24 @@ import json
 import geojson
 from shapely.geometry import LineString, mapping
 
+def sanitize_directory_name(name, relation_id=None):
+    """Czyści nazwę katalogu, aby była bezpieczna na różnych systemach operacyjnych."""
+    # Zamień znaki niedozwolone w nazwach plików/katalogów na bezpieczne alternatywy
+    illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '=', '>']
+    sanitized_name = name
+    
+    for char in illegal_chars:
+        sanitized_name = sanitized_name.replace(char, '_')
+    
+    # Usuń ewentualne spacje na początku i końcu
+    sanitized_name = sanitized_name.strip()
+    
+    # Jeśli nazwa jest pusta, użyj wartości domyślnej
+    if not sanitized_name and relation_id:
+        sanitized_name = f"relation_{relation_id}"
+        
+    return sanitized_name
+
 def fetch_relation(relation_id):
     """Pobiera dane relacji OSM na podstawie ID."""
     url = f"https://api.openstreetmap.org/api/0.6/relation/{relation_id}/full"
@@ -15,13 +33,13 @@ def fetch_relation(relation_id):
         sys.exit(1)
     return response.text
 
-def extract_relation_name(xml_data):
+def extract_relation_name(xml_data, relation_id):
     """Wyciąga nazwę relacji z danych XML."""
     root = ET.fromstring(xml_data)
     for relation in root.findall(".//relation"):
         for tag in relation.findall("tag"):
             if tag.get("k") == "name":
-                return tag.get("v")
+                return sanitize_directory_name(tag.get("v"), relation_id)
     return f"relation_{relation_id}"  # Domyślna nazwa jeśli nie znaleziono
 
 def extract_ways(xml_data):
@@ -227,7 +245,7 @@ def main():
     xml_data = fetch_relation(relation_id)
     
     # Wyciąganie nazwy relacji
-    relation_name = extract_relation_name(xml_data)
+    relation_name = extract_relation_name(xml_data, relation_id)
     print(f"Nazwa relacji: {relation_name}")
     
     # Tworzenie struktury katalogów
@@ -239,11 +257,25 @@ def main():
         os.makedirs(base_dir)
     
     # Tworzenie katalogu dla konkretnej relacji, jeśli nie istnieje
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    try:
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+    except Exception as e:
+        print(f"Błąd podczas tworzenia katalogu: {e}")
+        fallback_name = f"relation_{relation_id}"
+        output_dir = os.path.join(base_dir, fallback_name)
+        print(f"Używanie alternatywnej nazwy katalogu: {fallback_name}")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
     
     # Przetwarzanie danych
     raw_ways = extract_ways(xml_data)  # Zawiera tylko elementy z pustą rolą
+    
+    if not raw_ways:
+        print(f"Nie znaleziono elementów z pustą rolą (role=\"\") w relacji {relation_id}.")
+        print("Sprawdź, czy relacja zawiera elementy typu 'way' z pustą rolą.")
+        sys.exit(1)
+        
     geojson_data, ordered_ways = create_geojson(raw_ways)
     
     # Zapisywanie plików
