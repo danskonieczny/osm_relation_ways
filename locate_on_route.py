@@ -708,7 +708,7 @@ def main():
     verbose = False
     if len(sys.argv) > 5 and sys.argv[5] == "-v":
         verbose = True
-        print("Włączono tryb gadatliwy")
+        print("Włączono tryb rozszerzony")
     
     # Zamień kolejność na [longitude, latitude] dla standardu GeoJSON
     location = (lon, lat)

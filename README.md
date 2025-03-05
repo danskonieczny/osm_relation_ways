@@ -72,7 +72,7 @@ Parametry:
 -   `<plik_przystanków.json>` - ścieżka do pliku z przystankami (np. `osm_relations/ZDMIKP_Bydgoszcz/5_Loskon_Rycerska/relation_17444158_stops.json`)
 -   `<lat>` - szerokość geograficzna (latitude) punktu do zlokalizowania
 -   `<lon>` - długość geograficzna (longitude) punktu do zlokalizowania
--   `-v` - opcjonalny parametr włączający tryb gadatliwy (więcej informacji diagnostycznych)
+-   `-v` - opcjonalny parametr włączający tryb rozszerzony (więcej informacji diagnostycznych)
 
 Przykład:
 
