@@ -211,7 +211,8 @@ def load_data(route_file, stops_file=None):
                             stop_data = {
                                 "id": props.get("id", "unknown"),
                                 "position": coords,
-                                "role": props.get("role", "stop")
+                                "role": props.get("role", "stop"),
+                                "name": props.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
                             }
                             
                             # Sprawdź, czy są dodatkowe informacje o odległości
@@ -352,12 +353,15 @@ def find_nearest_stops(route_line, stops_data, current_position, current_distanc
                         stop_distance = float(stop["dist"])
                         print(f"Użyto odległości z pliku (dist): {stop_distance:.2f} m")
             
-            stops_with_distance.append({
+            stop_data = {
                 "id": stop.get("id", ""),
                 "role": stop.get("role", "stop"),
                 "position": stop_position,
-                "distance_from_start": stop_distance
-            })
+                "distance_from_start": stop_distance,
+                "name": stop.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
+            }
+            
+            stops_with_distance.append(stop_data)
         except Exception as e:
             print(f"Pominięto przystanek z powodu błędu: {e}")
     
@@ -373,7 +377,8 @@ def find_nearest_stops(route_line, stops_data, current_position, current_distanc
     print("\nInformacje o wszystkich przystankach na trasie:")
     for i, stop in enumerate(sorted_stops):
         stop_lat, stop_lon = stop["position"][1], stop["position"][0]
-        print(f"{i+1}. Przystanek ID: {stop['id']} (lat, lon): ({stop_lat}, {stop_lon}) - odległość: {stop['distance_from_start']:.2f} m")
+        stop_name = stop.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
+        print(f"{i+1}. Przystanek ID: {stop['id']} - {stop_name} (lat, lon): ({stop_lat}, {stop_lon}) - odległość: {stop['distance_from_start']:.2f} m")
     
     # 1. Znajdź poprzedni przystanek (ostatni przystanek przed lub równy aktualnej pozycji)
     for i in range(len(sorted_stops) - 1, -1, -1):  # Przeszukujemy od końca do początku
@@ -381,7 +386,8 @@ def find_nearest_stops(route_line, stops_data, current_position, current_distanc
         if stop["distance_from_start"] <= current_distance or abs(stop["distance_from_start"] - current_distance) < 1.0:
             previous_stop = stop.copy()
             previous_stop["distance_to_current"] = current_distance - stop["distance_from_start"]
-            print(f"Znaleziono poprzedni przystanek: ID {stop['id']}, odległość: {previous_stop['distance_to_current']:.2f} m")
+            stop_name = stop.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
+            print(f"Znaleziono poprzedni przystanek: ID {stop['id']} - {stop_name}, odległość: {previous_stop['distance_to_current']:.2f} m")
             break
     
     # 2. Znajdź następny przystanek (pierwszy przystanek po aktualnej pozycji)
@@ -389,17 +395,20 @@ def find_nearest_stops(route_line, stops_data, current_position, current_distanc
         if stop["distance_from_start"] > current_distance:
             next_stop = stop.copy()
             next_stop["distance_from_current"] = stop["distance_from_start"] - current_distance
-            print(f"Znaleziono następny przystanek: ID {stop['id']}, odległość: {next_stop['distance_from_current']:.2f} m")
+            stop_name = stop.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
+            print(f"Znaleziono następny przystanek: ID {stop['id']} - {stop_name}, odległość: {next_stop['distance_from_current']:.2f} m")
             break
     
     # Wyświetl informacje o znalezionych przystankach
     if previous_stop:
-        print(f"Najbliższy poprzedni przystanek: ID {previous_stop['id']}, {previous_stop['distance_to_current']:.2f} m za nami")
+        prev_name = previous_stop.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
+        print(f"Najbliższy poprzedni przystanek: ID {previous_stop['id']} - {prev_name}, {previous_stop['distance_to_current']:.2f} m za nami")
     else:
         print("Nie znaleziono poprzedniego przystanku - jesteśmy na początku trasy")
     
     if next_stop:
-        print(f"Najbliższy następny przystanek: ID {next_stop['id']}, {next_stop['distance_from_current']:.2f} m przed nami")
+        next_name = next_stop.get("name", "Brak nazwy")  # Dodajemy nazwę przystanku
+        print(f"Najbliższy następny przystanek: ID {next_stop['id']} - {next_name}, {next_stop['distance_from_current']:.2f} m przed nami")
     else:
         print("Nie znaleziono następnego przystanku - jesteśmy na końcu trasy")
     
@@ -630,8 +639,10 @@ def pretty_print_result(result):
     if result['previous_stop']:
         prev = result['previous_stop']
         prev_lat, prev_lon = prev['position'][1], prev['position'][0]  # Odwrócona kolejność dla wyświetlania
+        prev_name = prev.get('name', 'Brak nazwy')  # Pobierz nazwę przystanku
         print(f"Poprzedni przystanek:")
         print(f"  ID: {prev['id']}")
+        print(f"  Nazwa: {prev_name}")
         print(f"  Typ: {prev['role']}")
         print(f"  Pozycja (lat, lon): ({prev_lat}, {prev_lon})")
         print(f"  Odległość od początku trasy: {prev['distance_from_start']:.2f} m")
@@ -642,8 +653,10 @@ def pretty_print_result(result):
     if result['next_stop']:
         next_s = result['next_stop']
         next_lat, next_lon = next_s['position'][1], next_s['position'][0]  # Odwrócona kolejność dla wyświetlania
+        next_name = next_s.get('name', 'Brak nazwy')  # Pobierz nazwę przystanku
         print(f"Następny przystanek:")
         print(f"  ID: {next_s['id']}")
+        print(f"  Nazwa: {next_name}")
         print(f"  Typ: {next_s['role']}")
         print(f"  Pozycja (lat, lon): ({next_lat}, {next_lon})")
         print(f"  Odległość od początku trasy: {next_s['distance_from_start']:.2f} m")
@@ -655,11 +668,14 @@ def pretty_print_result(result):
     if result['previous_stop'] and result['next_stop']:
         prev_stop = result['previous_stop']
         next_stop = result['next_stop']
+        prev_name = prev_stop.get('name', 'Brak nazwy')
+        next_name = next_stop.get('name', 'Brak nazwy')
         total_distance_between_stops = next_stop['distance_from_start'] - prev_stop['distance_from_start']
         current_distance_from_prev = result['distance_from_start'] - prev_stop['distance_from_start']
         progress_between_stops = (current_distance_from_prev / total_distance_between_stops * 100) if total_distance_between_stops > 0 else 0
         
         print("\n--- POZYCJA POMIĘDZY PRZYSTANKAMI ---")
+        print(f"Przystanki: {prev_name} → {next_name}")
         print(f"Odległość między przystankami: {total_distance_between_stops:.2f} m")
         print(f"Odległość przebyta od poprzedniego przystanku: {current_distance_from_prev:.2f} m")
         print(f"Postęp między przystankami: {progress_between_stops:.2f}%")
