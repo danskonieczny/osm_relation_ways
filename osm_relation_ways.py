@@ -1,3 +1,89 @@
+import os
+import sys
+import requests
+import xml.etree.ElementTree as ET
+import json
+import geojson
+from shapely.geometry import LineString, Point, mapping
+import math
+
+def replace_polish_characters(text):
+    """Zamienia polskie znaki na ich odpowiedniki bez znaków diakrytycznych."""
+    replacements = {
+        'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z',
+        'Ą': 'A', 'Ć': 'C', 'Ę': 'E', 'Ł': 'L', 'Ń': 'N', 'Ó': 'O', 'Ś': 'S', 'Ź': 'Z', 'Ż': 'Z'
+    }
+    
+    for polish, latin in replacements.items():
+        text = text.replace(polish, latin)
+    
+    return text
+
+def sanitize_directory_name(name):
+    """Czyści nazwę katalogu, aby była bezpieczna na różnych systemach operacyjnych."""
+    # Zamień znaki niedozwolone w nazwach plików/katalogów na podkreślniki
+    illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '=', '>']
+    sanitized_name = name
+    
+    for char in illegal_chars:
+        sanitized_name = sanitized_name.replace(char, '_')
+    
+    # Zamiana spacji na podkreślniki
+    sanitized_name = sanitized_name.replace(' ', '_')
+    
+    # Zamiana polskich znaków na ich odpowiedniki bez znaków diakrytycznych
+    sanitized_name = replace_polish_characters(sanitized_name)
+    
+    # Usuń ewentualne podkreślniki na początku i końcu
+    sanitized_name = sanitized_name.strip('_')
+    
+    return sanitized_name
+
+def extract_directory_structure(xml_data):
+    """Wyciąga informacje potrzebne do utworzenia struktury katalogów z danych XML."""
+    root = ET.fromstring(xml_data)
+    
+    network = ""
+    ref = ""
+    from_tag = ""
+    to_tag = ""
+    relation_id = ""
+    
+    # Znajdź dane relacji
+    for relation in root.findall(".//relation"):
+        relation_id = relation.get("id", "")
+        for tag in relation.findall("tag"):
+            if tag.get("k") == "network":
+                network = tag.get("v", "")
+            elif tag.get("k") == "ref":
+                ref = tag.get("v", "")
+            elif tag.get("k") == "from":
+                from_tag = tag.get("v", "")
+            elif tag.get("k") == "to":
+                to_tag = tag.get("v", "")
+    
+    # Sanityzacja nazw
+    network = sanitize_directory_name(network)
+    ref = sanitize_directory_name(ref)
+    from_tag = sanitize_directory_name(from_tag)
+    to_tag = sanitize_directory_name(to_tag)
+    
+    # Jeśli nie znaleziono wszystkich potrzebnych danych, użyj domyślnych wartości
+    if not network:
+        network = "unknown_network"
+    if not ref:
+        ref = "unknown_ref"
+    if not from_tag:
+        from_tag = "unknown_from"
+    if not to_tag:
+        to_tag = "unknown_to"
+    
+    # Stwórz nazwę głównego folderu i podfolderu
+    main_folder = network
+    sub_folder = f"{ref}_{from_tag}_{to_tag}"
+    
+    return relation_id, main_folder, sub_folder
+
 def haversine_distance(coord1, coord2):
     """Oblicza odległość między dwoma punktami na powierzchni Ziemi w metrach."""
     lon1, lat1 = coord1
@@ -91,33 +177,6 @@ def locate_stops_on_route(ordered_ways, stop_nodes):
     
     return sorted_stops
 
-import os
-import sys
-import requests
-import xml.etree.ElementTree as ET
-import json
-import geojson
-from shapely.geometry import LineString, Point, mapping
-import math
-
-def sanitize_directory_name(name, relation_id=None):
-    """Czyści nazwę katalogu, aby była bezpieczna na różnych systemach operacyjnych."""
-    # Zamień znaki niedozwolone w nazwach plików/katalogów na bezpieczne alternatywy
-    illegal_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '=', '>']
-    sanitized_name = name
-    
-    for char in illegal_chars:
-        sanitized_name = sanitized_name.replace(char, '_')
-    
-    # Usuń ewentualne spacje na początku i końcu
-    sanitized_name = sanitized_name.strip()
-    
-    # Jeśli nazwa jest pusta, użyj wartości domyślnej
-    if not sanitized_name and relation_id:
-        sanitized_name = f"relation_{relation_id}"
-        
-    return sanitized_name
-
 def fetch_relation(relation_id):
     """Pobiera dane relacji OSM na podstawie ID."""
     url = f"https://api.openstreetmap.org/api/0.6/relation/{relation_id}/full"
@@ -127,26 +186,25 @@ def fetch_relation(relation_id):
         sys.exit(1)
     return response.text
 
-def extract_relation_name(xml_data, relation_id):
-    """Wyciąga nazwę relacji z danych XML."""
-    root = ET.fromstring(xml_data)
-    for relation in root.findall(".//relation"):
-        for tag in relation.findall("tag"):
-            if tag.get("k") == "name":
-                return sanitize_directory_name(tag.get("v"), relation_id)
-    return f"relation_{relation_id}"  # Domyślna nazwa jeśli nie znaleziono
-
 def extract_ways_and_stops(xml_data):
     """Wyciąga dane dróg i przystanków z relacji."""
     root = ET.fromstring(xml_data)
     
-    # Zbieranie wszystkich węzłów
+    # Zbieranie wszystkich węzłów wraz z ich tagami
     nodes = {}
+    node_tags = {}  # Nowy słownik do przechowywania tagów dla każdego węzła
     for node in root.findall(".//node"):
         node_id = node.get("id")
         lat = float(node.get("lat"))
         lon = float(node.get("lon"))
         nodes[node_id] = (lon, lat)  # GeoJSON używa (długość, szerokość)
+        
+        # Zbieramy tagi dla tego węzła
+        tags = {}
+        for tag in node.findall("tag"):
+            tags[tag.get("k")] = tag.get("v")
+        if tags:  # Przechowujemy tagi tylko jeśli istnieją
+            node_tags[node_id] = tags
     
     # Słownik do przechowywania informacji o rolach elementów w relacji
     member_roles = {}
@@ -162,13 +220,19 @@ def extract_ways_and_stops(xml_data):
             elif member.get("type") == "node" and member.get("role") in ["stop", "stop_entry_only", "stop_exit_only", "platform", "platform_entry_only", "platform_exit_only"]:
                 stop_node_ref = member.get("ref")
                 if stop_node_ref in nodes:
-                    # Zapisz pozycję, ID i rolę przystanku
-                    stop_nodes.append({
+                    # Zapisz pozycję, ID, rolę i nazwę przystanku
+                    stop_info = {
                         "id": stop_node_ref,
                         "position": nodes[stop_node_ref],
                         "role": member.get("role", ""),
                         "dist_from_start": 0  # To będzie obliczone później
-                    })
+                    }
+                    
+                    # Dodaj nazwę przystanku, jeśli jest dostępna
+                    if stop_node_ref in node_tags and "name" in node_tags[stop_node_ref]:
+                        stop_info["name"] = node_tags[stop_node_ref]["name"]
+                    
+                    stop_nodes.append(stop_info)
     
     # Zbieranie dróg z zachowaniem oryginalnej kolejności
     # Uwzględniamy TYLKO elementy z pustą rolą (role="")
@@ -316,6 +380,7 @@ def create_geojson(ways, stops=None):
                 "type": "stop",
                 "order": i,
                 "role": stop.get("role", "stop"),
+                "name": stop.get("name", ""),  # Dodajemy nazwę przystanku
                 "dist_from_start": stop["dist_from_start"],
                 "distance_from_prev": stop["distance_from_prev"],
                 "distance_to_next": stop["distance_to_next"]
@@ -370,7 +435,8 @@ def save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, stop
             f.write("\nPrzystanki (od początku trasy):\n")
             for i, stop in enumerate(stops_data):
                 role_text = stop.get("role", "stop")
-                f.write(f"{i+1}. Stop ID: {stop['id']} (role=\"{role_text}\")\n")
+                name_text = stop.get("name", "Bez nazwy")  # Dodajemy nazwę przystanku
+                f.write(f"{i+1}. Stop ID: {stop['id']} (role=\"{role_text}\") - Nazwa: {name_text}\n")
                 f.write(f"   Odległość od początku trasy: {stop['dist_from_start']:.2f} m ({stop['dist_from_start']/1000:.2f} km)\n")
                 f.write(f"   Odległość od poprzedniego przystanku: {stop['distance_from_prev']:.2f} m ({stop['distance_from_prev']/1000:.2f} km)\n")
                 f.write(f"   Odległość do następnego przystanku: {stop['distance_to_next']:.2f} m ({stop['distance_to_next']/1000:.2f} km)\n")
@@ -386,26 +452,31 @@ def main():
     # Pobieranie danych relacji
     xml_data = fetch_relation(relation_id)
     
-    # Wyciąganie nazwy relacji
-    relation_name = extract_relation_name(xml_data, relation_id)
-    print(f"Nazwa relacji: {relation_name}")
+    # Wyciąganie informacji o strukturze katalogów
+    relation_id, main_folder, sub_folder = extract_directory_structure(xml_data)
+    print(f"Struktura katalogów: {main_folder}/{sub_folder}")
     
     # Tworzenie struktury katalogów
     base_dir = "osm_relations"
-    output_dir = os.path.join(base_dir, relation_name)
+    main_dir = os.path.join(base_dir, main_folder)
+    output_dir = os.path.join(main_dir, sub_folder)
     
     # Tworzenie katalogu bazowego, jeśli nie istnieje
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
     
-    # Tworzenie katalogu dla konkretnej relacji, jeśli nie istnieje
+    # Tworzenie katalogu głównego dla sieci
+    if not os.path.exists(main_dir):
+        os.makedirs(main_dir)
+    
+    # Tworzenie katalogu dla konkretnej relacji
     try:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
     except Exception as e:
         print(f"Błąd podczas tworzenia katalogu: {e}")
         fallback_name = f"relation_{relation_id}"
-        output_dir = os.path.join(base_dir, fallback_name)
+        output_dir = os.path.join(main_dir, fallback_name)
         print(f"Używanie alternatywnej nazwy katalogu: {fallback_name}")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -453,7 +524,9 @@ def main():
         print("\nPrzystanki (od początku trasy):")
         for i, stop in enumerate(ordered_stops):
             role = stop.get("role", "stop")
-            print(f"{i+1}. Stop ID: {stop['id']} (role=\"{role}\") - odległość od początku: {stop['dist_from_start']:.2f} m")
+            name = stop.get("name", "Bez nazwy")  # Dodajemy nazwę przystanku
+            print(f"{i+1}. Stop ID: {stop['id']} (role=\"{role}\") - Nazwa: {name}")
+            print(f"   Odległość od początku trasy: {stop['dist_from_start']:.2f} m")
             print(f"   Odległość od poprzedniego przystanku: {stop['distance_from_prev']:.2f} m")
             print(f"   Odległość do następnego przystanku: {stop['distance_to_next']:.2f} m")
             
