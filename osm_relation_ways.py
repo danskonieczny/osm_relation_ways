@@ -7,6 +7,92 @@ import geojson
 from shapely.geometry import LineString, Point, mapping
 import math
 
+def analyze_route_bidirectional(raw_ways):
+    """
+    Analizuje trasę pod kątem możliwości dwukierunkowego łączenia odcinków.
+    Sprawdza wszystkie potencjalne połączenia, niezależnie od oryginalnej orientacji odcinków.
+    """
+    if not raw_ways:
+        return "Nie znaleziono żadnych odcinków trasy."
+    
+    # Zbierz wszystkie unikalne węzły
+    all_nodes = set()
+    for way in raw_ways:
+        all_nodes.add(way["start_node"])
+        all_nodes.add(way["end_node"])
+    
+    # Przygotuj mapę połączeń dla każdego węzła
+    node_connections = {}
+    for node in all_nodes:
+        node_connections[node] = {"ways": []}
+    
+    # Dodaj informacje o wszystkich połączeniach
+    for i, way in enumerate(raw_ways):
+        start_node = way["start_node"]
+        end_node = way["end_node"]
+        
+        node_connections[start_node]["ways"].append({"way_id": way["id"], "way_index": i, "connection": "start"})
+        node_connections[end_node]["ways"].append({"way_id": way["id"], "way_index": i, "connection": "end"})
+    
+    # Analizuj każdy węzeł
+    node_analysis = {}
+    terminal_nodes = []  # Węzły z tylko jednym połączeniem (potencjalne końce trasy)
+    junction_nodes = []  # Węzły z więcej niż dwoma połączeniami (potencjalne skrzyżowania)
+    
+    for node, data in node_connections.items():
+        connection_count = len(data["ways"])
+        node_analysis[node] = {
+            "connections": connection_count,
+            "ways": data["ways"]
+        }
+        
+        if connection_count == 1:
+            terminal_nodes.append(node)
+        elif connection_count > 2:
+            junction_nodes.append(node)
+    
+    # Przygotuj raport
+    report = []
+    report.append(f"Analiza trasy dla {len(raw_ways)} odcinków:")
+    report.append(f"- Znaleziono {len(all_nodes)} unikalnych węzłów")
+    
+    if terminal_nodes:
+        report.append(f"- Znaleziono {len(terminal_nodes)} węzłów końcowych (z tylko jednym połączeniem):")
+        for node in terminal_nodes:
+            ways = node_connections[node]["ways"]
+            way_info = ", ".join([f"{w['way_id']} ({w['connection']})" for w in ways])
+            report.append(f"  * Węzeł {node}: {way_info}")
+    
+    if junction_nodes:
+        report.append(f"- Znaleziono {len(junction_nodes)} węzłów skrzyżowań (z więcej niż dwoma połączeniami):")
+        for node in junction_nodes:
+            ways = node_connections[node]["ways"]
+            connection_count = len(ways)
+            report.append(f"  * Węzeł {node}: {connection_count} połączeń")
+            for w in ways:
+                report.append(f"    - Odcinek {w['way_id']} (jako {w['connection']})")
+    
+    # Sprawdź, czy trasa może być ciągła
+    if len(terminal_nodes) == 2:
+        report.append("- Trasa wygląda na potencjalnie ciągłą, ma dokładnie 2 węzły końcowe.")
+    elif len(terminal_nodes) == 0:
+        report.append("- Trasa może być zamkniętą pętlą (nie ma węzłów końcowych).")
+    else:
+        report.append(f"- UWAGA: Trasa ma {len(terminal_nodes)} węzłów końcowych, co oznacza prawdopodobne nieciągłości.")
+    
+    # Szukaj nieciągłości (sprawdź czy każdy nieterminalny węzeł ma przynajmniej 2 połączenia)
+    disconnected_nodes = []
+    for node, data in node_analysis.items():
+        if node not in terminal_nodes and data["connections"] < 2:
+            disconnected_nodes.append(node)
+    
+    if disconnected_nodes:
+        report.append(f"- WYKRYTO {len(disconnected_nodes)} węzłów z potencjalnymi nieciągłościami:")
+        for node in disconnected_nodes:
+            report.append(f"  * Węzeł {node}: ma tylko {node_analysis[node]['connections']} połączenie(a)")
+    
+    return "\n".join(report)
+
 def replace_polish_characters(text):
     """Zamienia polskie znaki na ich odpowiedniki bez znaków diakrytycznych."""
     replacements = {
@@ -262,10 +348,47 @@ def extract_ways_and_stops(xml_data):
     
     return raw_ways, stop_nodes
 
-def arrange_ways_in_order(raw_ways):
-    """Układa odcinki dróg w kolejności, aby tworzyły spójną trasę."""
+def arrange_ways_bidirectionally(raw_ways):
+    """
+    Układa odcinki dróg w kolejności, traktując je jako dwukierunkowe.
+    Minimalizuje liczbę odwróconych odcinków, preferując zachowanie
+    oryginalnej orientacji gdzie to możliwe.
+    """
     if not raw_ways:
         return []
+    
+    # Tworzenie pomocniczej klasy dla segmentu trasy, która może być odwrócona
+    class RouteSegment:
+        def __init__(self, way, reversed=False):
+            self.way = way
+            self.reversed = reversed
+            
+        @property
+        def start_node(self):
+            return self.way["end_node"] if self.reversed else self.way["start_node"]
+            
+        @property
+        def end_node(self):
+            return self.way["start_node"] if self.reversed else self.way["end_node"]
+            
+        @property
+        def id(self):
+            return self.way["id"]
+            
+        def to_dict(self):
+            """Zwraca słownik reprezentujący odcinek (z możliwym odwróceniem)"""
+            result = self.way.copy()
+            if self.reversed:
+                # Zamień start i end node w zwracanym słowniku
+                result["start_node"], result["end_node"] = result["end_node"], result["start_node"]
+                # Odwróć także listę węzłów, jeśli istnieje
+                if "nodes" in result:
+                    result["nodes"] = list(reversed(result["nodes"]))
+                if "node_ids" in result:
+                    result["node_ids"] = list(reversed(result["node_ids"]))
+                # Dodaj flagę, że ten odcinek został odwrócony
+                result["reversed"] = True
+            return result
     
     # Filtrujemy tylko odcinki, które nie są pętlami
     route_ways = []
@@ -280,74 +403,252 @@ def arrange_ways_in_order(raw_ways):
     if not route_ways:
         return raw_ways  # Jeśli nie ma głównych odcinków trasy, zwróć wszystkie
     
-    # Tworzenie słownika węzłów końcowych do odcinków
-    end_to_ways = {}
-    start_to_ways = {}
+    # Tworzymy indeksy węzłów dla szybkiego wyszukiwania
+    node_connections = {}
     
-    for i, way in enumerate(route_ways):
+    for way in route_ways:
         start_node = way["start_node"]
         end_node = way["end_node"]
         
-        if start_node not in start_to_ways:
-            start_to_ways[start_node] = []
-        start_to_ways[start_node].append(i)
+        if start_node not in node_connections:
+            node_connections[start_node] = []
+        if end_node not in node_connections:
+            node_connections[end_node] = []
         
-        if end_node not in end_to_ways:
-            end_to_ways[end_node] = []
-        end_to_ways[end_node].append(i)
+        node_connections[start_node].append(way["id"])
+        node_connections[end_node].append(way["id"])
     
-    # Znajdowanie potencjalnego początku trasy
-    # Początek to węzeł, który jest punktem początkowym jakiegoś odcinka, 
-    # ale nie jest punktem końcowym żadnego innego odcinka lub występuje rzadziej jako końcowy
-    potential_starts = []
-    for node in start_to_ways:
-        if node not in end_to_ways:
-            potential_starts.append((node, 999))  # Wysoki priorytet dla węzłów, które są tylko startowe
-        else:
-            # Jeśli węzeł występuje częściej jako początkowy niż końcowy
-            if len(start_to_ways[node]) > len(end_to_ways[node]):
-                potential_starts.append((node, len(start_to_ways[node]) - len(end_to_ways[node])))
+    # Znajdź potencjalne punkty końcowe (węzły, które pojawiają się tylko raz)
+    endpoints = []
+    for node, ways in node_connections.items():
+        if len(ways) == 1:
+            endpoints.append(node)
     
-    # Sortuj potencjalne początki wg priorytetu (malejąco)
-    potential_starts.sort(key=lambda x: x[1], reverse=True)
+    # Jeśli znaleziono dokładnie 2 punkty końcowe, użyj jednego jako początek
+    start_node = None
+    if len(endpoints) >= 2:
+        start_node = endpoints[0]
+    else:
+        # W przeciwnym razie użyj węzła z najmniejszą liczbą połączeń
+        nodes_by_connections = sorted(node_connections.items(), key=lambda x: len(x[1]))
+        if nodes_by_connections:
+            start_node = nodes_by_connections[0][0]
     
-    ordered_ways = []
-    used_indices = set()
+    # Jeśli nadal nie mamy punktu startowego, użyj pierwszego węzła z listy
+    if start_node is None and route_ways:
+        start_node = route_ways[0]["start_node"]
     
-    # Próbujemy zbudować spójną trasę
-    if potential_starts:
-        current_node = potential_starts[0][0]  # Bierzemy węzeł o najwyższym priorytecie
+    # Przygotuj mapę id odcinka do obiektu
+    way_map = {way["id"]: way for way in route_ways}
+    
+    # Rozpocznij budowanie trasy od punktu startowego
+    ordered_segments = []
+    used_way_ids = set()
+    
+    current_node = start_node
+    
+    # Ustaw preferowany kierunek dla pierwszego odcinka - staraj się używać oryginalnej orientacji
+    prefer_original_orientation = True
+    
+    while True:
+        # Znajdź odcinki łączące się z bieżącym węzłem
+        connecting_ways_original = []  # Odcinki w oryginalnej orientacji
+        connecting_ways_reversed = []  # Odcinki, które trzeba odwrócić
         
-        # Budujemy główną trasę od początku do końca
-        while True:
-            # Szukamy odcinka, który zaczyna się od current_node i nie był jeszcze użyty
-            next_way_index = None
-            for i in start_to_ways.get(current_node, []):
-                if i not in used_indices:
-                    next_way_index = i
+        for way_id in node_connections.get(current_node, []):
+            if way_id not in used_way_ids:
+                way = way_map[way_id]
+                
+                # Sprawdź, w jaki sposób odcinek łączy się z bieżącym węzłem
+                if way["start_node"] == current_node:
+                    # Odcinek zaczyna się w bieżącym węźle - zachowuje oryginalną orientację
+                    connecting_ways_original.append(RouteSegment(way, reversed=False))
+                elif way["end_node"] == current_node:
+                    # Odcinek kończy się w bieżącym węźle - trzeba go odwrócić
+                    connecting_ways_reversed.append(RouteSegment(way, reversed=True))
+        
+        # Wybierz następny segment preferując zachowanie oryginalnej orientacji
+        next_segment = None
+        if prefer_original_orientation and connecting_ways_original:
+            next_segment = connecting_ways_original[0]
+        elif connecting_ways_reversed:
+            next_segment = connecting_ways_reversed[0]
+        elif connecting_ways_original:
+            next_segment = connecting_ways_original[0]
+        
+        if next_segment is None:
+            break  # Nie znaleziono więcej połączeń
+        
+        ordered_segments.append(next_segment)
+        used_way_ids.add(next_segment.id)
+        
+        # Przejdź do następnego węzła
+        current_node = next_segment.end_node
+    
+    # Jeśli mamy więcej odcinków, które nie zostały użyte, tworzymy osobne łańcuchy
+    chain_segments = []
+    
+    while len(used_way_ids) < len(route_ways):
+        # Wybierz odcinek do rozpoczęcia nowego łańcucha - preferuj jeden z punktów końcowych
+        start_way = None
+        start_at_endpoint = False
+        
+        # Najpierw sprawdź, czy możemy zacząć od któregoś punktu końcowego
+        for node in endpoints:
+            for way_id in node_connections.get(node, []):
+                if way_id not in used_way_ids:
+                    way = way_map[way_id]
+                    start_way = way
+                    # Preferuj rozpoczęcie łańcucha od punktu początkowego odcinka
+                    start_at_endpoint = (way["start_node"] == node)
                     break
+            if start_way:
+                break
+        
+        # Jeśli nie znaleziono odcinka przy punktach końcowych, wybierz dowolny nieużyty
+        if not start_way:
+            for way in route_ways:
+                if way["id"] not in used_way_ids:
+                    start_way = way
+                    start_at_endpoint = False  # Nie zaczynamy od punktu końcowego
+                    break
+        
+        if not start_way:
+            break  # Nie ma więcej odcinków do dodania
+        
+        # Tworzymy nowy łańcuch
+        current_chain = []
+        
+        if start_at_endpoint:
+            # Jeśli zaczynamy od punktu końcowego, zachowaj oryginalną orientację
+            segment = RouteSegment(start_way, reversed=False)
+        else:
+            # W przeciwnym razie, zaczynamy od wyboru optymalnej orientacji
+            # Sprawdzamy, czy więcej odcinków łączy się z punktem końcowym czy początkowym
+            end_connections = len([wid for wid in node_connections.get(start_way["end_node"], []) 
+                                  if wid not in used_way_ids and wid != start_way["id"]])
+            start_connections = len([wid for wid in node_connections.get(start_way["start_node"], []) 
+                                    if wid not in used_way_ids and wid != start_way["id"]])
             
-            if next_way_index is None:
-                break  # Nie znaleźliśmy pasującego odcinka, kończymy główną trasę
+            # Wybierz orientację, która ma więcej przyszłych połączeń
+            segment = RouteSegment(start_way, reversed=(start_connections > end_connections))
+        
+        current_chain.append(segment)
+        used_way_ids.add(segment.id)
+        current_node = segment.end_node
+        
+        # Kontynuuj budowanie łańcucha
+        while True:
+            connecting_ways = []
             
-            ordered_ways.append(route_ways[next_way_index])
-            used_indices.add(next_way_index)
-            current_node = route_ways[next_way_index]["end_node"]
+            for way_id in node_connections.get(current_node, []):
+                if way_id not in used_way_ids:
+                    way = way_map[way_id]
+                    
+                    if way["start_node"] == current_node:
+                        # Preferuj zachowanie oryginalnej orientacji
+                        connecting_ways.append(RouteSegment(way, reversed=False))
+                    elif way["end_node"] == current_node:
+                        connecting_ways.append(RouteSegment(way, reversed=True))
+            
+            if not connecting_ways:
+                break  # Koniec łańcucha
+            
+            next_segment = connecting_ways[0]
+            current_chain.append(next_segment)
+            used_way_ids.add(next_segment.id)
+            current_node = next_segment.end_node
+        
+        if current_chain:
+            chain_segments.append(current_chain)
     
-    # Dodajemy pozostałe odcinki główne, które nie zostały jeszcze dodane
-    for i, way in enumerate(route_ways):
-        if i not in used_indices:
-            ordered_ways.append(way)
+    # Próbuj połączyć główny łańcuch i dodatkowe łańcuchy
+    all_chains = [ordered_segments] + chain_segments
     
-    # Dodajemy pętle na końcu
+    # Sortuj łańcuchy według długości (najdłuższy pierwszy)
+    all_chains.sort(key=len, reverse=True)
+    
+    # Konsoliduj łańcuchy, próbując je połączyć
+    final_chain = all_chains[0] if all_chains else []
+    
+    for chain in all_chains[1:]:
+        # Sprawdź, czy można dołączyć ten łańcuch na początku lub końcu głównego łańcucha
+        if chain and final_chain:
+            chain_start = chain[0].start_node
+            chain_end = chain[-1].end_node
+            main_start = final_chain[0].start_node
+            main_end = final_chain[-1].end_node
+            
+            if main_end == chain_start:
+                # Łańcuch pasuje do końca głównego łańcucha
+                final_chain.extend(chain)
+            elif main_start == chain_end:
+                # Łańcuch pasuje do początku głównego łańcucha
+                final_chain = chain + final_chain
+            elif main_end == chain_end:
+                # Łańcuch pasuje do końca głównego łańcucha, ale musimy go odwrócić
+                final_chain.extend([RouteSegment(s.way, not s.reversed) for s in reversed(chain)])
+            elif main_start == chain_start:
+                # Łańcuch pasuje do początku głównego łańcucha, ale musimy go odwrócić
+                final_chain = [RouteSegment(s.way, not s.reversed) for s in reversed(chain)] + final_chain
+            else:
+                # Nie można połączyć - po prostu dodaj na końcu
+                final_chain.extend(chain)
+        else:
+            final_chain.extend(chain)
+    
+    # Konwertuj segmenty na słowniki
+    ordered_ways = [segment.to_dict() for segment in final_chain]
+    
+    # Dodaj pętle na końcu
     ordered_ways.extend(loop_ways)
     
+    # Policz odwrócone odcinki
+    reversed_count = sum(1 for way in ordered_ways if "reversed" in way and way["reversed"])
+    
+    # Sprawdź, czy nie byłoby lepiej odwrócić całą trasę
+    # Jeśli większość odcinków jest odwrócona, odwróć całą trasę
+    if reversed_count > len(ordered_ways) / 2:
+        initial_reversed_count = reversed_count
+        print(f"Wstępnie {initial_reversed_count} z {len(ordered_ways)} odcinków jest odwróconych - odwracam całą trasę dla lepszej spójności.")
+        # Odwróć całą trasę (bez pętli)
+        non_loop_ways = [way for way in ordered_ways if "start_node" in way and way["start_node"] != way["end_node"]]
+        
+        # Odwróć trasę i przełącz flagi reversed
+        non_loop_ways.reverse()
+        for way in non_loop_ways:
+            way["start_node"], way["end_node"] = way["end_node"], way["start_node"]
+            if "nodes" in way:
+                way["nodes"] = list(reversed(way["nodes"]))
+            if "node_ids" in way:
+                way["node_ids"] = list(reversed(way["node_ids"]))
+            
+            # Aktualizuj flagę reversed
+            if "reversed" in way:
+                way["reversed"] = not way["reversed"]
+            else:
+                way["reversed"] = True  # Jeśli segment nie był wcześniej oznaczony jako odwrócony, to teraz jest
+        
+        # Połącz z pętlami
+        ordered_ways = non_loop_ways + loop_ways
+
+        reversed_count = sum(1 for way in ordered_ways if "reversed" in way and way["reversed"])
+        print(f"Po odwróceniu trasy: {reversed_count} z {len(ordered_ways)} odcinków pozostaje odwróconych.")
+            # Wyświetl informacje o złożonej trasie
+
+    print(f"\nUłożono trasę składającą się z {len(ordered_ways)} odcinków.")
+    if ordered_ways:
+        print(f"Punkt początkowy: {ordered_ways[0]['start_node']}")
+        print(f"Punkt końcowy: {ordered_ways[-1]['end_node']}")
+        print(f"Liczba odwróconych odcinków: {reversed_count} z {len(ordered_ways)}")
+        
     return ordered_ways
 
-def create_geojson(ways, stops=None):
+def create_geojson(ways, stops=None, ordered_ways=None):
     """Tworzy plik GeoJSON na podstawie dróg i przystanków."""
-    # Najpierw układamy drogi w odpowiedniej kolejności
-    ordered_ways = arrange_ways_in_order(ways)
+    # Jeśli nie podano już uporządkowanych odcinków, przetworz je
+    if ordered_ways is None:
+        ordered_ways = arrange_ways_bidirectionally(ways)
     
     features = []
     
@@ -429,7 +730,8 @@ def save_files(relation_id, xml_data, raw_ways, ordered_ways, geojson_data, stop
         
         f.write("Odcinki trasy (kolejność):\n")
         for i, way in enumerate(ordered_ways):
-            f.write(f"{i+1}. Way ID: {way['id']} (od węzła {way['start_node']} do {way['end_node']})\n")
+            reversed_info = " (ODWRÓCONY)" if "reversed" in way and way["reversed"] else ""
+            f.write(f"{i+1}. Way ID: {way['id']}{reversed_info} (od węzła {way['start_node']} do {way['end_node']})\n")
         
         if stops_data:
             f.write("\nPrzystanki (od początku trasy):\n")
@@ -489,8 +791,34 @@ def main():
         print("Sprawdź, czy relacja zawiera elementy typu 'way' z pustą rolą.")
         sys.exit(1)
     
-    # Tworzenie GeoJSON i porządkowanie odcinków
-    geojson_data, ordered_ways = create_geojson(raw_ways, None)  # Najpierw bez przystanków
+    print(analyze_route_bidirectional(raw_ways))
+
+    # Najpierw wykonujemy jednokrotne uporządkowanie odcinków trasy
+    ordered_ways = arrange_ways_bidirectionally(raw_ways)
+    
+    # Tworzymy GeoJSON bez przystanków - używamy existing funkcji z trochę innym wywołaniem
+    geojson_features = []
+    
+    # Dodajemy informację o oryginalnej kolejności dróg
+    for i, way in enumerate(ordered_ways):
+        line = LineString(way["nodes"])
+        
+        # Podstawowe właściwości
+        properties = {
+            "id": way["id"],
+            "type": "route_segment",
+            "order": i,
+            "start_node": way["start_node"],
+            "end_node": way["end_node"]
+        }
+        
+        feature = geojson.Feature(
+            geometry=mapping(line),
+            properties=properties
+        )
+        geojson_features.append(feature)
+    
+    geojson_data = geojson.FeatureCollection(geojson_features)
     
     # Obliczanie długości trasy
     route_length = calculate_route_length(ordered_ways)
@@ -503,7 +831,49 @@ def main():
         ordered_stops = locate_stops_on_route(ordered_ways, stop_nodes)
         
         # Aktualizacja GeoJSON z przystankami
-        geojson_data, _ = create_geojson(raw_ways, ordered_stops)
+        geojson_features = []
+        
+        # Dodajemy informację o oryginalnej kolejności dróg
+        for i, way in enumerate(ordered_ways):
+            line = LineString(way["nodes"])
+            
+            # Podstawowe właściwości
+            properties = {
+                "id": way["id"],
+                "type": "route_segment",
+                "order": i,
+                "start_node": way["start_node"],
+                "end_node": way["end_node"]
+            }
+            
+            feature = geojson.Feature(
+                geometry=mapping(line),
+                properties=properties
+            )
+            geojson_features.append(feature)
+        
+        # Dodajemy przystanki jako punkty
+        for i, stop in enumerate(ordered_stops):
+            point = Point(stop["position"])
+            
+            properties = {
+                "id": stop["id"],
+                "type": "stop",
+                "order": i,
+                "role": stop.get("role", "stop"),
+                "name": stop.get("name", ""),
+                "dist_from_start": stop["dist_from_start"],
+                "distance_from_prev": stop["distance_from_prev"],
+                "distance_to_next": stop["distance_to_next"]
+            }
+            
+            feature = geojson.Feature(
+                geometry=mapping(point),
+                properties=properties
+            )
+            geojson_features.append(feature)
+        
+        geojson_data = geojson.FeatureCollection(geojson_features)
     else:
         print("Nie znaleziono przystanków (role=\"stop\", \"stop_entry_only\", \"stop_exit_only\", itp.) w relacji.")
         ordered_stops = []
@@ -517,7 +887,8 @@ def main():
     # Informacja o uporządkowanej trasie
     print("\nOdcinki trasy zostały ułożone w następującej kolejności:")
     for i, way in enumerate(ordered_ways):
-        print(f"{i+1}. Way ID: {way['id']} (od węzła {way['start_node']} do {way['end_node']})")
+        reversed_info = " (ODWRÓCONY)" if "reversed" in way and way["reversed"] else ""
+        print(f"{i+1}. Way ID: {way['id']}{reversed_info} (od węzła {way['start_node']} do {way['end_node']})")
     
     # Informacja o przystankach
     if ordered_stops:
