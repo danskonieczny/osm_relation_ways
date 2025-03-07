@@ -303,7 +303,7 @@ def extract_ways_and_stops(xml_data):
                 way_id = member.get("ref")
                 role = member.get("role", "")
                 member_roles[way_id] = role
-            elif member.get("type") == "node" and member.get("role") in ["stop", "stop_entry_only", "stop_exit_only", "platform", "platform_entry_only", "platform_exit_only"]:
+            elif member.get("type") == "node" and (member.get("role") == "stop" or member.get("role", "").startswith("stop_")):
                 stop_node_ref = member.get("ref")
                 if stop_node_ref in nodes:
                     # Zapisz pozycję, ID, rolę i nazwę przystanku
@@ -711,13 +711,7 @@ def generate_gps_directions(ordered_ways, stops=None):
         nodes = way["nodes"]
         for i in range(len(nodes) - 1):
             total_distance += haversine_distance(nodes[i], nodes[i+1])
-    
-    # Formatowanie całkowitej długości zgodnie z zasadami
-    if total_distance < 1000:
-        directions.append(f"Cała trasa ma długość około {round_to_nearest_10(total_distance)} m.")
-    else:
-        directions.append(f"Cała trasa ma długość około {total_distance/1000:.1f} km.")
-    
+
     # Lista punktów charakterystycznych (manewry i przystanki) z odległościami
     significant_points = []
     
