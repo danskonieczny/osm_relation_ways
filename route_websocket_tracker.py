@@ -12,6 +12,10 @@ import websockets
 from datetime import datetime
 from shapely.geometry import Point, LineString
 from shapely.ops import nearest_points
+import folium
+import webbrowser
+import threading
+from branca.element import Figure
 
 class RouteTracker:
     """Klasa do śledzenia pozycji na trasie. Wczytuje dane raz i umożliwia wielokrotne lokalizowanie."""
@@ -626,6 +630,306 @@ class RouteTracker:
         
         return result
 
+    def generate_navigation_directions(self):
+        """Generuje wskazówki nawigacyjne na podstawie trasy."""
+        if not self.route_data:
+            return [], []
+        
+        # Przygotuj pełną trasę jako listę punktów
+        route_points = []
+        route_node_ids = []  # Zachowaj również ID węzłów dla referencji
+        for way in self.route_data:
+            if not route_points:
+                if "nodes" in way:
+                    route_points.extend(way["nodes"])
+                    if "node_ids" in way:
+                        route_node_ids.extend(way["node_ids"])
+            else:
+                # Dodaj punkty bez duplikowania ostatniego/pierwszego punktu między odcinkami
+                if "nodes" in way and len(way["nodes"]) > 1:
+                    route_points.extend(way["nodes"][1:])
+                    if "node_ids" in way and len(way["node_ids"]) > 1:
+                        route_node_ids.extend(way["node_ids"][1:])
+        
+        # Przygotuj punkty przystanków, jeśli są dostępne
+        stop_points = []
+        if self.stops_data:
+            for stop in self.stops_data:
+                if "position" in stop:
+                    stop_points.append({
+                        "position": stop["position"],
+                        "name": stop.get("name", "Przystanek bez nazwy"),
+                        "dist_from_start": stop.get("dist_from_start", 0),
+                        "id": stop.get("id", "")
+                    })
+            # Sortuj przystanki według odległości od początku trasy
+            stop_points.sort(key=lambda x: x["dist_from_start"])
+        
+        # Lista wskazówek i punktów charakterystycznych
+        directions = []
+        significant_points = []
+        
+        # Sprawdź, czy mamy przystanek na początku trasy
+        has_start_stop = False
+        if stop_points and stop_points[0]["dist_from_start"] < 50:  # Jeśli pierwszy przystanek jest blisko początku
+            has_start_stop = True
+            first_stop_name = stop_points[0]["name"]
+            directions.append(f"Rozpocznij trasę na przystanku {first_stop_name}.")
+        else:
+            first_way = self.route_data[0]
+            directions.append(f"Rozpocznij trasę w punkcie startowym (węzeł {first_way.get('start_node', 'nieznany')}).")
+        
+        # Znajdź pierwszy kierunek
+        if len(route_points) >= 3:
+            initial_bearing = self.calculate_bearing(route_points[0], route_points[2])
+            directions.append(f"Kieruj się na {self.get_cardinal_direction(initial_bearing)}.")
+        
+        # Wykryj istotne zakręty na trasie
+        last_significant_bearing = None
+        if len(route_points) >= 3:
+            # Ustaw początkowy kierunek jazdy
+            last_significant_bearing = self.calculate_bearing(route_points[0], route_points[2])
+        
+        # Parametry do wykrywania zakrętów
+        step_size = 10  # Krok w punktach trasy
+        lookback = 10    # Ile punktów wstecz patrzymy
+        lookahead = 20   # Ile punktów w przód patrzymy
+        min_turn_threshold = 40  # Minimalny kąt zmiany kierunku uznawany za zakręt (w stopniach)
+        
+        turn_points = []
+        i = lookback
+        while i < len(route_points) - lookahead:
+            # Sprawdź kierunek jazdy przed potencjalnym zakrętem
+            pre_turn_bearing = self.calculate_bearing(route_points[i-lookback], route_points[i])
+            
+            # Sprawdź kierunek jazdy po potencjalnym zakręcie
+            post_turn_bearing = self.calculate_bearing(route_points[i], route_points[i+lookahead])
+            
+            # Oblicz zmianę kierunku (skręt)
+            bearing_change = (post_turn_bearing - pre_turn_bearing + 180) % 360 - 180
+            
+            # Jeśli jest to istotna zmiana kierunku
+            if abs(bearing_change) >= min_turn_threshold:
+                # Oblicz dystans od początku trasy do punktu zakrętu
+                current_distance = 0
+                for j in range(i):
+                    if j < len(route_points) - 1:
+                        current_distance += self.haversine_distance(route_points[j], route_points[j+1])
+                
+                # Określ kierunek skrętu
+                turn_direction = "w prawo" if bearing_change > 0 else "w lewo"
+                
+                # Określ intensywność skrętu
+                if abs(bearing_change) > 100:
+                    turn_intensity = "ostro "
+                elif abs(bearing_change) > 60:
+                    turn_intensity = ""
+                else:
+                    turn_intensity = "lekko "
+                
+                # Zapisz informacje o zakręcie
+                turn_points.append({
+                    "type": "turn",
+                    "index": i,
+                    "distance": current_distance,
+                    "bearing_change": bearing_change,
+                    "pre_bearing": pre_turn_bearing,
+                    "post_bearing": post_turn_bearing,
+                    "instruction": f"Skręć {turn_intensity}{turn_direction}, kierując się na {self.get_cardinal_direction(post_turn_bearing)}.",
+                    "node_id": route_node_ids[i] if i < len(route_node_ids) else None
+                })
+                
+                # Przeskocz punkty, aby uniknąć wykrywania tego samego zakrętu kilka razy
+                i += lookahead
+                continue
+            
+            i += step_size
+        
+        # Dodaj zakręty do listy punktów charakterystycznych
+        significant_points.extend(turn_points)
+        
+        # Dodaj przystanki do listy punktów charakterystycznych
+        if self.stops_data:
+            for i, stop in enumerate(stop_points):
+                # Pomijamy pierwszy przystanek, jeśli był użyty jako punkt początkowy
+                if has_start_stop and i == 0:
+                    continue
+                    
+                # Sprawdź, czy to ostatni przystanek - będzie uwzględniony w instrukcji końcowej
+                if i == len(stop_points) - 1 and stop["dist_from_start"] > self.total_route_length - 50:
+                    continue
+                    
+                significant_points.append({
+                    "type": "stop",
+                    "distance": stop["dist_from_start"],
+                    "name": stop["name"],
+                    "instruction": f"Przystanek {stop['name']}.",
+                    "id": stop["id"]
+                })
+        
+        # Sortuj wszystkie punkty charakterystyczne według odległości od początku trasy
+        significant_points.sort(key=lambda x: x["distance"])
+        
+        # Oblicz odległość od poprzedniego punktu dla każdego punktu
+        for i in range(len(significant_points)):
+            if i > 0:
+                significant_points[i]["distance_from_last"] = significant_points[i]["distance"] - significant_points[i-1]["distance"]
+            else:
+                significant_points[i]["distance_from_last"] = significant_points[i]["distance"]
+        
+        # Generuj wskazówki na podstawie uporządkowanych punktów charakterystycznych
+        for point in significant_points:
+            # Formatuj odległość zgodnie z zasadami
+            dist = point["distance_from_last"]
+            if dist < 1000:
+                rounded_dist = self.round_to_nearest_10(dist)
+                dist_formatted = f"ok. {rounded_dist} m"
+            else:
+                dist_formatted = f"{dist/1000:.1f} km"
+                
+            directions.append(f"{dist_formatted} {point['instruction']}")
+        
+        # Dodaj wskazówkę końcową
+        if significant_points:
+            last_point_distance = significant_points[-1]["distance"]
+            remaining_distance = self.total_route_length - last_point_distance
+            
+            # Formatuj pozostałą odległość zgodnie z zasadami
+            if remaining_distance < 1000:
+                rounded_dist = self.round_to_nearest_10(remaining_distance)
+                dist_formatted = f"ok. {rounded_dist} m"
+            else:
+                dist_formatted = f"{remaining_distance/1000:.1f} km"
+                
+            directions.append(f"{dist_formatted} kontynuuj jazdę prosto.")
+        
+        # Sprawdź, czy mamy przystanek na końcu trasy
+        if stop_points and stop_points[-1]["dist_from_start"] > self.total_route_length - 50:
+            last_stop_name = stop_points[-1]["name"]
+            directions.append(f"Dotarłeś do celu - przystanek {last_stop_name}.")
+        else:
+            last_way = self.route_data[-1]
+            directions.append(f"Dotarłeś do celu (węzeł {last_way.get('end_node', 'nieznany')}).")
+        
+        return directions, significant_points
+
+    def calculate_bearing(self, point1, point2):
+        """
+        Oblicza azymut (kąt) między dwoma punktami.
+        Zwraca wartość w stopniach (0-359), gdzie 0 to północ, 90 to wschód, itd.
+        """
+        import math
+        
+        lon1, lat1 = point1
+        lon2, lat2 = point2
+        
+        # Zamiana stopni na radiany
+        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+        
+        # Wzór na azymut
+        y = math.sin(lon2 - lon1) * math.cos(lat2)
+        x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(lon2 - lon1)
+        bearing = math.atan2(y, x)
+        
+        # Zamiana radianów na stopnie i normalizacja do zakresu 0-359
+        bearing = (math.degrees(bearing) + 360) % 360
+        
+        return bearing
+
+    def get_cardinal_direction(self, bearing):
+        """
+        Zwraca kierunek świata (N, NE, E, SE, S, SW, W, NW) dla danego azymutu.
+        """
+        directions = ["północ", "północny wschód", "wschód", "południowy wschód", 
+                    "południe", "południowy zachód", "zachód", "północny zachód"]
+        
+        index = round(bearing / 45) % 8
+        return directions[index]
+
+    def round_to_nearest_10(self, value):
+        """
+        Zaokrągla wartość do najbliższej dziesiątki.
+        Np. 456 -> 460, 412 -> 410, 65 -> 70
+        """
+        return int(round(value / 10) * 10)
+
+    def update_navigation_distances(self, current_distance):
+        """
+        Aktualizuje odległości do charakterystycznych punktów trasy
+        na podstawie aktualnej pozycji.
+        
+        Args:
+            current_distance: Aktualna odległość od początku trasy w metrach
+        
+        Returns:
+            Zaktualizowane wskazówki i najbliższy punkt charakterystyczny
+        """
+        # Jeśli nie mamy wygenerowanych wskazówek, zrób to najpierw
+        if not hasattr(self, 'navigation_directions') or not hasattr(self, 'navigation_points'):
+            self.navigation_directions, self.navigation_points = self.generate_navigation_directions()
+        else:
+            # Użyj już wygenerowanych wskazówek
+            significant_points = self.navigation_points
+        
+        # Pobierz wygenerowane punkty
+        significant_points = self.navigation_points
+        
+        # Znajdź najbliższy następny punkt charakterystyczny
+        next_point = None
+        prev_point = None
+        
+        # Znajdź najbliższy następny punkt
+        for i, point in enumerate(significant_points):
+            if point["distance"] > current_distance:
+                next_point = point.copy()
+                # Zaktualizuj odległość do tego punktu
+                next_point["distance_to_current"] = point["distance"] - current_distance
+                
+                # Jeśli to nie pierwszy punkt, zapisz również poprzedni
+                if i > 0:
+                    prev_point = significant_points[i-1].copy()
+                break
+        
+        # Jeśli nie znaleziono następnego punktu, jesteśmy blisko końca
+        if next_point is None and significant_points:
+            # Użyj ostatniego punktu
+            next_point = significant_points[-1].copy()
+            # Zaktualizuj odległość do końca trasy
+            remaining_distance = self.total_route_length - current_distance
+            next_point["distance_to_current"] = remaining_distance
+            
+            # Jeśli jesteśmy już za ostatnim punktem, zaktualizuj instrukcję
+            if next_point["distance"] < current_distance:
+                next_point["instruction"] = "Dotarłeś do celu."
+        
+        # Przygotuj aktualną wskazówkę
+        current_instruction = "Brak wskazówek."
+        if next_point:
+            # Formatuj odległość zgodnie z zasadami
+            dist = next_point["distance_to_current"]
+            if dist < 1000:
+                rounded_dist = self.round_to_nearest_10(dist)
+                dist_formatted = f"ok. {rounded_dist} m"
+            else:
+                dist_formatted = f"{dist/1000:.1f} km"
+            
+            # Stwórz wskazówkę
+            current_instruction = f"Za {dist_formatted}: {next_point['instruction']}"
+            
+            # Dodaj informację o ukończonym postępie, jeśli mamy poprzedni punkt
+            if prev_point:
+                progress = (current_distance - prev_point["distance"]) / (next_point["distance"] - prev_point["distance"]) * 100
+                current_instruction += f"\nPostęp do następnego punktu: {progress:.1f}%"
+        
+        return current_instruction, next_point, significant_points
+
+    def initialize_navigation(self):
+        """Inicjalizuje nawigację, generując wskazówki i punkty charakterystyczne."""
+        # Generuj wskazówki i zapisz je jako atrybuty klasy
+        self.navigation_directions, self.navigation_points = self.generate_navigation_directions()
+        self.print_info(f"Wygenerowano {len(self.navigation_directions)} wskazówek i {len(self.navigation_points)} punktów charakterystycznych")
+        return self.navigation_directions, self.navigation_points
+
 class WebSocketTracker:
     """Klasa do śledzenia pojazdów za pomocą WebSocket."""
     
@@ -640,6 +944,7 @@ class WebSocketTracker:
         self.last_position = None
         self.last_result = None
         self.last_update_time = None
+        self.map_visualizer = None
     
     def print_info(self, message):
         """Wyświetla komunikat, tylko jeśli tryb gadatliwy jest włączony."""
@@ -711,6 +1016,7 @@ class WebSocketTracker:
             self.print_info(f"Dostępne numery pojazdów: {', '.join(all_numbers)}")
         
         return None
+    
     def extract_location(self, vehicle_data):
         """Wyciąga pozycję z danych pojazdu."""
         if not vehicle_data or not isinstance(vehicle_data, dict):
@@ -741,9 +1047,12 @@ class WebSocketTracker:
             return None
     
     def pretty_print_position(self, position, result):
-        """Wyświetla informacje o aktualnej pozycji pojazdu."""
+        """Wyświetla informacje o aktualnej pozycji pojazdu wraz z wskazówkami nawigacyjnymi."""
         if not position or not result:
             return
+        
+        # Pobierz aktualne wskazówki nawigacyjne
+        current_instruction, next_point, all_points = self.tracker.update_navigation_distances(result['distance_from_start'])
         
         # Nagłówek z podstawowymi informacjami
         clear_console()
@@ -759,6 +1068,10 @@ class WebSocketTracker:
             speed = position.get('speed', 0)
             if isinstance(speed, (int, float)):
                 print(f"Prędkość: {speed:.1f} km/h")
+        
+        # Wskazówka nawigacyjna
+        print("\n=== WSKAZÓWKA NAWIGACYJNA ===")
+        print(current_instruction)
         
         # Informacje o pozycji na trasie
         print("\n--- POZYCJA NA TRASIE ---")
@@ -804,6 +1117,26 @@ class WebSocketTracker:
             progress_bar = '█' * filled_width + '░' * (bar_width - filled_width)
             print(f"{prev_name} {progress_bar} {next_name}")
         
+        # Nadchodzące punkty charakterystyczne
+        if all_points:
+            print("\n--- NADCHODZĄCE PUNKTY CHARAKTERYSTYCZNE ---")
+            upcoming_count = 0
+            for point in all_points:
+                if point["distance"] > result['distance_from_start']:
+                    dist_to_point = point["distance"] - result['distance_from_start']
+                    if dist_to_point < 1000:
+                        rounded_dist = self.tracker.round_to_nearest_10(dist_to_point)
+                        dist_formatted = f"ok. {rounded_dist} m"
+                    else:
+                        dist_formatted = f"{dist_to_point/1000:.1f} km"
+                    
+                    point_type = "Zakręt" if point.get("type") == "turn" else "Przystanek"
+                    print(f"  • {point_type} za {dist_formatted}: {point['instruction']}")
+                    
+                    upcoming_count += 1
+                    if upcoming_count >= 3:  # Pokaż tylko 3 najbliższe punkty
+                        break
+        
         # Informacja o aktualnym czasie (dla odniesienia)
         print(f"\nAktualny czas: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("Naciśnij Ctrl+C, aby zakończyć śledzenie...")
@@ -817,8 +1150,8 @@ class WebSocketTracker:
         
         # Sprawdź, czy pozycja się zmieniła
         is_new_position = (self.last_position is None or 
-                          position['latitude'] != self.last_position['latitude'] or 
-                          position['longitude'] != self.last_position['longitude'])
+                        position['latitude'] != self.last_position['latitude'] or 
+                        position['longitude'] != self.last_position['longitude'])
         
         # Aktualizuj tylko jeśli pozycja się zmieniła lub minęło wystarczająco dużo czasu
         if is_new_position or self.last_update_time is None or (now - self.last_update_time) >= self.update_interval:
@@ -829,18 +1162,32 @@ class WebSocketTracker:
                 # Wyświetl informacje
                 self.pretty_print_position(position, result)
                 
+                # Aktualizuj wizualizację na mapie
+                # if self.map_visualizer:
+                #     self.map_visualizer.update_vehicle_position(position, result)
+                
                 # Aktualizuj ostatnie dane
                 self.last_position = position
                 self.last_result = result
                 self.last_update_time = now
             except Exception as e:
                 print(f"Błąd podczas lokalizacji pojazdu: {e}")
-    
+
     async def start_tracking(self):
         """Rozpoczyna śledzenie pojazdu poprzez WebSocket."""
         self.running = True
         print(f"Rozpoczynam śledzenie pojazdu o numerze: {self.vehicle_id}")
         print(f"Łączę z websocketem: {self.websocket_url}")
+        
+        # Inicjalizacja nawigacji
+        print("Inicjalizacja nawigacji...")
+        self.tracker.initialize_navigation()
+        print("Nawigacja gotowa.")
+        
+        # Inicjalizacja wizualizatora mapy
+        # Linie zakomentowane - zgodnie z życzeniem użytkownika
+        # self.map_visualizer = RouteMapVisualizer(self.tracker)
+        # self.map_visualizer.start_auto_refresh(interval=5)
         
         try:
             async with websockets.connect(self.websocket_url) as websocket:
@@ -878,11 +1225,262 @@ class WebSocketTracker:
                         await asyncio.sleep(1)
         except Exception as e:
             print(f"Błąd połączenia z websocketem: {e}")
-    
+
     def stop_tracking(self):
-        """Zatrzymuje śledzenie pojazdu."""
+            """Zatrzymuje śledzenie pojazdu."""
+            self.running = False
+            # Zatrzymaj wizualizator mapy
+            # if self.map_visualizer:
+            #     self.map_visualizer.stop_auto_refresh()
+            print("Zatrzymano śledzenie pojazdu.")
+
+class RouteMapVisualizer:
+    """Klasa do wizualizacji trasy i pojazdu na mapie."""
+    
+    def __init__(self, tracker, map_file_path="route_map.html", auto_open=True, auto_refresh=True):
+        """
+        Inicjalizacja wizualizatora.
+        
+        Args:
+            tracker: Instancja RouteTracker zawierająca dane o trasie i przystankach
+            map_file_path: Ścieżka, gdzie ma być zapisany plik HTML z mapą
+            auto_open: Czy automatycznie otworzyć mapę w przeglądarce
+            auto_refresh: Czy automatycznie odświeżać mapę
+        """
+        self.tracker = tracker
+        self.map_file_path = map_file_path
+        self.auto_open = auto_open
+        self.auto_refresh = auto_refresh
+        self.vehicle_position = None
+        self.map = None
+        self.vehicle_marker = None
+        self.last_update_time = None
         self.running = False
-        print("Zatrzymano śledzenie pojazdu.")
+        self.refresh_thread = None
+        
+        # Inicjalizacja mapy
+        self.create_map()
+    
+    def create_map(self):
+        """Tworzy początkową mapę z trasą i przystankami."""
+        # Zbierz wszystkie punkty trasy do obliczenia centrum
+        all_points = []
+        for way in self.tracker.route_data:
+            if "nodes" in way and way["nodes"]:
+                for node in way["nodes"]:
+                    # W GeoJSON kolejność to [lon, lat], ale dla folium potrzebujemy [lat, lon]
+                    all_points.append((node[1], node[0]))
+        
+        # Jeśli nie ma punktów, użyj domyślnych współrzędnych
+        if not all_points:
+            center = [52.2297, 21.0122]  # Warszawa jako domyślna lokalizacja
+        else:
+            # Oblicz średnie współrzędne jako centrum mapy
+            avg_lat = sum(p[0] for p in all_points) / len(all_points)
+            avg_lon = sum(p[1] for p in all_points) / len(all_points)
+            center = [avg_lat, avg_lon]
+        
+        # Stwórz figurę z określonymi wymiarami
+        fig = Figure(height='90%', width='100%')
+        
+        # Utwórz mapę
+        self.map = folium.Map(
+            location=center,
+            zoom_start=13,
+            tiles='OpenStreetMap'
+        )
+        fig.add_child(self.map)
+        
+        # Dodaj trasę
+        self._add_route_to_map()
+        
+        # Dodaj przystanki
+        self._add_stops_to_map()
+        
+        # Zapisz mapę do pliku
+        self.map.save(self.map_file_path)
+        
+        # Otwórz mapę w przeglądarce, jeśli opcja jest włączona
+        if self.auto_open:
+            webbrowser.open('file://' + os.path.abspath(self.map_file_path))
+    
+    def _add_route_to_map(self):
+        """Dodaje linię trasy do mapy."""
+        route_points = []
+        
+        # Zbierz wszystkie punkty trasy w jedną listę
+        for way in self.tracker.route_data:
+            if "nodes" in way and way["nodes"]:
+                # Przekształć punkty z [lon, lat] na [lat, lon] dla folium
+                segment_points = [(node[1], node[0]) for node in way["nodes"]]
+                route_points.extend(segment_points)
+        
+        # Dodaj linię trasy
+        if route_points:
+            folium.PolyLine(
+                route_points,
+                color='blue',
+                weight=5,
+                opacity=0.7,
+                tooltip='Trasa'
+            ).add_to(self.map)
+    
+    def _add_stops_to_map(self):
+        """Dodaje przystanki do mapy."""
+        for stop in self.tracker.stops_data:
+            if "position" in stop and stop["position"]:
+                # Przekształć punkt z [lon, lat] na [lat, lon] dla folium
+                stop_position = (stop["position"][1], stop["position"][0])
+                
+                # Pobierz nazwę przystanku
+                stop_name = stop.get("name", "Przystanek")
+                
+                # Dodaj marker przystanku
+                folium.Marker(
+                    stop_position,
+                    popup=f"<b>{stop_name}</b><br>ID: {stop.get('id', 'N/A')}<br>Odległość od początku: {stop.get('dist_from_start', 0):.2f} m",
+                    tooltip=stop_name,
+                    icon=folium.Icon(color='green', icon='bus', prefix='fa')
+                ).add_to(self.map)
+    
+    def update_vehicle_position(self, position, result):
+        """
+        Aktualizuje pozycję pojazdu na mapie.
+        
+        Args:
+            position: Dane o pozycji pojazdu
+            result: Wynik lokalizacji z RouteTracker
+        """
+        if not position:
+            return
+        
+        # Aktualizuj czas ostatniej aktualizacji
+        self.last_update_time = time.time()
+        
+        # Zapisz pozycję pojazdu
+        self.vehicle_position = {
+            'latitude': position['latitude'],
+            'longitude': position['longitude'],
+            'heading': position.get('heading', 0),
+            'speed': position.get('speed', 0),
+            'line': position.get('line', 'N/A'),
+            'brigade': position.get('brigade', 'N/A'),
+            'timestamp': position.get('timestamp', None),
+            'distance_from_start': result['distance_from_start'],
+            'distance_to_route': result['distance_to_route'],
+            'progress_percentage': result['progress_percentage'],
+            'previous_stop': result['previous_stop'],
+            'next_stop': result['next_stop'],
+            'nearest_point_on_route': result['nearest_point_on_route']
+        }
+        
+        # Zaktualizuj mapę
+        self._update_map()
+    
+    def _create_vehicle_popup(self):
+        """Tworzy zawartość popup dla markera pojazdu."""
+        position = self.vehicle_position
+        timestamp = datetime.fromtimestamp(position['timestamp']).strftime('%H:%M:%S') if position.get('timestamp') else 'N/A'
+        
+        # Przygotuj informacje o przystankach
+        prev_stop_info = "Brak danych"
+        next_stop_info = "Brak danych"
+        
+        if position.get('previous_stop'):
+            prev = position['previous_stop']
+            prev_name = prev.get('name', 'Brak nazwy')
+            prev_stop_info = f"{prev_name} ({prev['distance_to_current']:.0f} m temu)"
+        
+        if position.get('next_stop'):
+            next_s = position['next_stop']
+            next_name = next_s.get('name', 'Brak nazwy')
+            next_stop_info = f"{next_name} (za {next_s['distance_from_current']:.0f} m)"
+        
+        # Stwórz zawartość HTML dla popup
+        popup_content = f"""
+        <div style="width: 200px;">
+            <h4>Pojazd: {position.get('line', 'N/A')}/{position.get('brigade', 'N/A')}</h4>
+            <p><b>Czas pomiaru:</b> {timestamp}</p>
+            <p><b>Prędkość:</b> {position.get('speed', 0):.1f} km/h</p>
+            <p><b>Odległość od trasy:</b> {position['distance_to_route']:.1f} m</p>
+            <p><b>Postęp na trasie:</b> {position['progress_percentage']:.1f}%</p>
+            <hr>
+            <p><b>Poprzedni przystanek:</b><br>{prev_stop_info}</p>
+            <p><b>Następny przystanek:</b><br>{next_stop_info}</p>
+            <p><i>Aktualizacja: {datetime.now().strftime('%H:%M:%S')}</i></p>
+        </div>
+        """
+        return popup_content
+    
+    def _update_map(self):
+        """Aktualizuje mapę z nową pozycją pojazdu."""
+        if not self.vehicle_position:
+            return
+        
+        # Utwórz nową mapę
+        self.create_map()
+        
+        # Dodaj marker pojazdu
+        popup_content = self._create_vehicle_popup()
+        
+        # Określ kolor markera na podstawie odległości od trasy
+        if self.vehicle_position['distance_to_route'] < 20:
+            color = 'red'  # Na trasie
+        elif self.vehicle_position['distance_to_route'] < 50:
+            color = 'orange'  # Blisko trasy
+        else:
+            color = 'darkred'  # Daleko od trasy
+        
+        # Dodaj marker pojazdu
+        folium.Marker(
+            [self.vehicle_position['latitude'], self.vehicle_position['longitude']],
+            popup=folium.Popup(popup_content, max_width=300),
+            tooltip=f"Pojazd {self.vehicle_position.get('line', 'N/A')}/{self.vehicle_position.get('brigade', 'N/A')}",
+            icon=folium.Icon(color=color, icon='bus', prefix='fa')
+        ).add_to(self.map)
+        
+        # Dodaj marker najbliższego punktu na trasie
+        if 'nearest_point_on_route' in self.vehicle_position:
+            nearest = self.vehicle_position['nearest_point_on_route']
+            folium.CircleMarker(
+                [nearest[1], nearest[0]],  # Zamień [lon, lat] na [lat, lon]
+                radius=5,
+                color='purple',
+                fill=True,
+                fill_color='purple',
+                tooltip='Najbliższy punkt na trasie'
+            ).add_to(self.map)
+        
+        # Zapisz mapę do pliku
+        self.map.save(self.map_file_path)
+    
+    def start_auto_refresh(self, interval=5):
+        """
+        Rozpoczyna automatyczne odświeżanie mapy.
+        
+        Args:
+            interval: Interwał odświeżania w sekundach
+        """
+        if not self.auto_refresh:
+            return
+        
+        self.running = True
+        
+        def refresh_loop():
+            while self.running:
+                time.sleep(interval)
+                if self.vehicle_position:
+                    self._update_map()
+        
+        self.refresh_thread = threading.Thread(target=refresh_loop)
+        self.refresh_thread.daemon = True
+        self.refresh_thread.start()
+    
+    def stop_auto_refresh(self):
+        """Zatrzymuje automatyczne odświeżanie mapy."""
+        self.running = False
+        if self.refresh_thread:
+            self.refresh_thread.join(timeout=1.0)
 
 def clear_console():
     """Czyści konsolę."""
